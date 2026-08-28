@@ -5,7 +5,8 @@ name = "pypi"
 
 [packages]
 flask = "*"
-uwsgi = "*"
+# Pin uWSGI to a newer compatible release for Alpine/Python 3.10
+uwsgi = "==2.0.23"
 flask-cors = "*"
 pytest = "*"
 
