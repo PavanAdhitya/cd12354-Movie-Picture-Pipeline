@@ -3,21 +3,17 @@ name: "Backend Continuous Deployment"
 on:
   push:
     branches: [ main ]
+    paths:
+      - 'starter/backend/**'
   workflow_dispatch:
 
 jobs:
-  build-and-deploy:
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
-    env:
-      IMAGE_TAG: ${{ github.sha }}
-      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      NAMESPACE: ${{ secrets.KUBE_NAMESPACE }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
@@ -27,118 +23,97 @@ jobs:
       - name: Install pipenv
         run: python -m pip install --upgrade pip pipenv
 
-      - name: Verify required files exist
-        run: |
-          set -e
-          test -f starter/backend/Dockerfile
-          test -f starter/backend/Pipfile
-          test -f starter/backend/k8s/deployment.yaml
-          test -f starter/backend/k8s/service.yaml
-
-      - name: Prepare image tag
-        run: |
-          set -e
-          # Use ECR_REPOSITORY if provided; otherwise default to local image name 'backend'
-          REPO=${ECR_REPOSITORY:-backend}
-          IMAGE=${REPO}:${IMAGE_TAG}
-          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
-          echo "Prepared image: $IMAGE"
-
-      - name: Install dependencies (pipenv)
+      - name: Install dependencies
         working-directory: starter/backend
         run: pipenv install --dev
 
-      - name: Lint
+      - name: Run lint
         working-directory: starter/backend
         run: pipenv run lint
 
-      - name: Test
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install pipenv
+        run: python -m pip install --upgrade pip pipenv
+
+      - name: Install dependencies
+        working-directory: starter/backend
+        run: pipenv install --dev
+
+      - name: Run tests
         working-directory: starter/backend
         run: pipenv run test
 
-      - name: Configure AWS credentials for ECR
-        if: ${{ env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY && env.ECR_REPOSITORY }}
-        uses: aws-actions/configure-aws-credentials@v2
+  build:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        if: ${{ env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY && env.ECR_REPOSITORY }}
-        uses: aws-actions/amazon-ecr-login@v1
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build Docker image
         working-directory: starter/backend
         run: |
           set -e
-          docker build -t "$IMAGE" .
+          docker build -t ${{ secrets.ECR_REPOSITORY }}:${{ github.sha }} .
 
-      - name: Validate Docker image by running container
+      - name: Run Docker container smoke test
         run: |
           set -e
-          # Run container in background, map to an ephemeral port and hit /movies
-          PORT=5001
-          docker run -d --rm --name backend-smoke -p ${PORT}:5000 "$IMAGE"
-          # wait for a short time for app to start
-          retries=0
-          until curl -sS http://localhost:${PORT}/movies || [ $retries -ge 10 ]; do
-            retries=$((retries+1))
-            sleep 1
-          done
-          curl -fsS http://localhost:${PORT}/movies
-          docker rm -f backend-smoke || true
+          docker run -d --rm --name backend-smoke -p 5001:5000 ${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}
+          sleep 5
+          curl -fsS http://localhost:5001/movies
+          docker stop backend-smoke
 
-      - name: Push image to ECR
-        if: ${{ env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY && env.ECR_REPOSITORY }}
+      - name: Push Docker image to ECR
         run: |
           set -e
-          docker push "$IMAGE"
+          docker push ${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}
 
       - name: Set up kubectl
         uses: azure/setup-kubectl@v3
         with:
           version: 'latest'
 
-      - name: Configure kubeconfig
-        run: |
-          mkdir -p $HOME/.kube
-          if [ -n "${{ secrets.KUBE_CONFIG_BASE64 }}" ]; then
-            echo "Decoding KUBE_CONFIG_BASE64"
-            echo "${{ secrets.KUBE_CONFIG_BASE64 }}" | base64 --decode > $HOME/.kube/config
-          elif [ -n "${{ secrets.KUBE_CONFIG }}" ]; then
-            echo "Writing KUBE_CONFIG"
-            echo "${{ secrets.KUBE_CONFIG }}" > $HOME/.kube/config
-          else
-            echo "No kubeconfig provided in secrets (KUBE_CONFIG_BASE64 or KUBE_CONFIG)" >&2
-            exit 1
-          fi
-          chmod 600 $HOME/.kube/config
-
-      - name: Deploy to Kubernetes
+      - name: Update kubeconfig
         run: |
           set -e
-          NAMESPACE=${NAMESPACE:-default}
-          kubectl set image deployment/backend backend="$IMAGE" -n "$NAMESPACE" --record
-          kubectl rollout status deployment/backend -n "$NAMESPACE" --timeout=120s
+          aws eks update-kubeconfig --name cluster --region ${{ secrets.AWS_REGION }}
 
-      - name: Verify backend API
+      - name: Apply Kubernetes manifests
+        working-directory: starter/backend/k8s
         run: |
           set -e
-          NAMESPACE=${NAMESPACE:-default}
-          SERVICE_IP=$(kubectl get svc backend -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-          SERVICE_HOST=$(kubectl get svc backend -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
-          if [ -n "$SERVICE_IP" ]; then
-            echo "Found external IP: $SERVICE_IP"
-            curl -fsS "http://$SERVICE_IP/movies"
-          elif [ -n "$SERVICE_HOST" ]; then
-            echo "Found external hostname: $SERVICE_HOST"
-            curl -fsS "http://$SERVICE_HOST/movies"
-          else
-            echo "No external IP; port-forwarding to test service in namespace $NAMESPACE"
-            kubectl port-forward -n "$NAMESPACE" svc/backend 5000:80 >/tmp/port-forward.log 2>&1 &
-            PF_PID=$!
-            sleep 3
-            curl -fsS http://localhost:5000/movies
-            kill $PF_PID || true
-          fi
+          kustomize build . | kubectl apply -f -
+
+      - name: Set deployment image
+        run: |
+          set -e
+          kubectl set image deployment/backend backend=${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Wait for rollout
+        run: |
+          set -e
+          kubectl rollout status deployment/backend --timeout=180s
