@@ -74,6 +74,18 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Set up Python for Pipfile.lock
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Regenerate Pipfile.lock
+        working-directory: starter/backend
+        run: |
+          set -e
+          pip install pipenv
+          pipenv lock
+
       - name: Build Docker image
         working-directory: starter/backend
         run: |
