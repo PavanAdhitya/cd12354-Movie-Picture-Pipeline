@@ -43,3 +43,6 @@ gh secret set ECR_REPOSITORY --body "123456789012.dkr.ecr.us-east-1.amazonaws.co
 - Kubernetes manifests are applied via `kustomize build`, then `kubectl set image` updates the container to the newly pushed ECR image.
 - The workflow waits for the rollout to complete (`kubectl rollout status`) and **fails** if the deployment does not become ready within 180 seconds.
 - No credentials are hardcoded — all come from GitHub Secrets.
+
+## Successful Pipeline Run Proof
+![Backend Continuous Deployment Success](../screenshots/backend_continuous_deployment_success.png)
